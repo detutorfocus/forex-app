@@ -1,0 +1,124 @@
+from __future__ import annotations
+from django.conf import settings
+from django.db import models
+
+
+class NotificationPreference(models.Model):
+    """
+    Locks what a user is allowed to receive + reduces spam.
+    """
+    TF_FAST = "FAST"
+    TF_MEDIUM = "MEDIUM"
+    TF_LONG = "LONG"
+    TF_CHOICES = [
+        (TF_FAST, "Fast/Short"),
+        (TF_MEDIUM, "Medium"),
+        (TF_LONG, "Long term"),
+    ]
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notify_prefs",
+    )
+
+    enabled = models.BooleanField(default=True)
+
+    # hard locks
+    confirmed_only = models.BooleanField(default=True)
+    min_confidence = models.PositiveSmallIntegerField(default=80)
+
+    # optional allow list (CSV like "EURUSD,XAUUSD")
+    symbols_csv = models.CharField(max_length=500, blank=True, default="")
+
+    # timeframe bucket filtering (optional; blank means all)
+    timeframe_bucket = models.CharField(
+        max_length=10, choices=TF_CHOICES, blank=True, default=""
+    )
+
+    # spam control
+    cooldown_seconds = models.PositiveIntegerField(default=900)  # 15 mins
+    max_per_hour = models.PositiveSmallIntegerField(default=6)
+
+    # channels
+    webpush_enabled = models.BooleanField(default=True)
+    telegram_enabled = models.BooleanField(default=False)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def allowed_symbols_set(self) -> set[str]:
+        if not self.symbols_csv.strip():
+            return set()
+        return {s.strip().upper() for s in self.symbols_csv.split(",") if s.strip()}
+
+
+class PushSubscription(models.Model):
+    """
+    Browser push subscription (VAPID).
+    One endpoint per user (unique).
+    """
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="push_subscriptions",
+    )
+    endpoint = models.TextField(unique=True)
+    p256dh = models.CharField(max_length=255)
+    auth = models.CharField(max_length=255)
+    user_agent = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def as_webpush_dict(self) -> dict:
+        return {
+            "endpoint": self.endpoint,
+            "keys": {"p256dh": self.p256dh, "auth": self.auth},
+        }
+
+
+class NotificationDelivery(models.Model):
+    """
+    Tracks deliveries to enforce cooldown + max_per_hour.
+    """
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notification_deliveries",
+    )
+    symbol = models.CharField(max_length=20)
+    timeframe = models.CharField(max_length=20, blank=True, default="")
+    channel = models.CharField(max_length=20, default="webpush")  # webpush/telegram
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user", "symbol", "timeframe", "created_at"]),
+        ]
+
+
+
+class SignalEvent(models.Model):
+    """
+    Audit trail of signals + notification attempts.
+    """
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="signal_events")
+
+    symbol = models.CharField(max_length=20)
+    timeframe = models.CharField(max_length=10)
+    side = models.CharField(max_length=10)  # BUY/SELL
+    confidence = models.PositiveIntegerField(default=0)
+
+    entry = models.FloatField(null=True, blank=True)
+    sl = models.FloatField(null=True, blank=True)
+    tp1 = models.FloatField(null=True, blank=True)
+    tp2 = models.FloatField(null=True, blank=True)
+    tp3 = models.FloatField(null=True, blank=True)
+
+    fingerprint = models.CharField(max_length=128, db_index=True)
+    payload = models.JSONField(default=dict)
+
+    webpush_sent = models.BooleanField(default=False)
+    telegram_sent = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["user", "fingerprint"])]
